@@ -1,9 +1,22 @@
 import uuid
-import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 from openenv.core.env_server.interfaces import Environment
 from models import GridEdgeAction, GridEdgeObservation, GridEdgeRewardInfo, GridEdgeState
 import math
+import pvlib
+
+def load_epw(path: str) -> list[dict]:
+    weather_df, _ = pvlib.iotools.read_epw(path)
+    
+    hours = []
+    for _, row in weather_df.iterrows():
+        hours.append({
+            "outdoor_temp": float(row["temp_air"]),
+            "ghi":          float(row["ghi"]),
+        })
+    
+    return hours
 
 def get_tariff(hour: int) -> float:
     if 6  <= hour < 9:  return 6.50
@@ -39,6 +52,11 @@ class HomeConfig:
     comfort_deadband_degc: float = 1.5
     thermal_penalty_weight: float = 0.3
 
+    loop_threshold: float = 3.0
+    loop_penalty_base: float = 0.2
+
+    load_profile: List[float] = [0.3, 0.3, 0.3, 0.3, 0.3, 0.4, 0.6, 0.9, 1.0, 0.8, 0.7, 0.7, 0.7, 0.6, 0.6, 0.7, 0.8, 1.2, 1.5, 1.8, 1.6, 1.2, 0.8, 0.5]
+
 
 class TheLocalMinimaEnvironment(Environment):
 
@@ -62,7 +80,7 @@ class TheLocalMinimaEnvironment(Environment):
         self._episode_start_hour = episode_start_hour
 
     def reset(self, task: str = "solar_self_consumption", config: Optional[HomeConfig] = None) -> GridEdgeObservation:
-        self._task   = task
+        self._task = task
         self._config = config or HomeConfig()
  
         self._recent_actions = []
@@ -96,74 +114,63 @@ class TheLocalMinimaEnvironment(Environment):
         return self._obs
 
     def step(self, action: GridEdgeAction) -> GridEdgeObservation:
-        cfg      = self._config
+        cfg = self._config
         step_idx = self._state.step_count
-        hour     = self._step_to_hour(step_idx)
+        hour = self._step_to_hour(step_idx)
         occupied = self._state.true_occupancy_vector[step_idx]
  
-        solar_kw  = self._solar_kw(step_idx)
-        tariff    = get_tariff(hour)
+        solar_kw = self._solar_kw(step_idx)
+        tariff = get_tariff(hour)
         base_load = cfg.load_profile[hour]
- 
-        # --- Clamp commands to physical limits ---
+
         battery_cmd, batt_violated = self._clamp_battery(action.battery_dispatch_command)
-        ev_cmd,      ev_violated   = self._clamp_ev(action.ev_charging_allocation)
+        ev_cmd, ev_violated= self._clamp_ev(action.ev_charging_allocation)
         constraint_violated = batt_violated or ev_violated
- 
-        # --- Electrical balance ---
-        hvac_draw  = cfg.hvac_power_kw if action.hvac_operational_mode != "off" else 0.0
+
+        hvac_draw = cfg.hvac_power_kw if action.hvac_operational_mode != "off" else 0.0
         total_load = base_load + hvac_draw + ev_cmd + max(0.0, battery_cmd)
-        total_gen  = solar_kw + max(0.0, -battery_cmd) * cfg.inverter_efficiency
-        net_grid   = total_load - total_gen   # positive = import, negative = export
- 
+        total_gen = solar_kw + max(0.0, -battery_cmd) * cfg.inverter_efficiency
+        net_grid = total_load - total_gen
         if net_grid < 0 and not action.grid_export_permission:
-            net_grid = 0.0   # curtail excess solar rather than exporting
- 
-        # --- Update SoCs ---
+            net_grid = 0.0
+
         new_batt_soc = self._update_battery_soc(battery_cmd)
-        new_ev_soc   = self._update_ev_soc(ev_cmd)
- 
-        # --- RC thermal model ---
+        new_ev_soc = self._update_ev_soc(ev_cmd)
+
         new_indoor_temp = self._update_indoor_temp(
             action.hvac_operational_mode,
             action.hvac_temperature_setpoint,
             self._outdoor_temp(step_idx),
             self._ghi(step_idx),
         )
- 
-        # --- Financial accounting ---
-        energy_cost = net_grid * tariff * 0.25   # kW × ₹/kWh × 0.25 hr = ₹
+
+        energy_cost = net_grid * tariff * 0.25
         self._state.cumulative_financial_cost += energy_cost
-        self._state.rbc_baseline_cost         += base_load * tariff * 0.25
- 
-        # --- Solar tracking ---
+        self._state.rbc_baseline_cost += base_load * tariff * 0.25
+
         self._state.solar_available_kwh += solar_kw * 0.25
         self._state.solar_utilized_kwh  += min(solar_kw, total_load) * 0.25
  
-        # --- Reward ---
-        financial_delta   = -energy_cost
-        thermal_penalty   = self._thermal_penalty(new_indoor_temp, action.hvac_temperature_setpoint, occupied)
-        ev_penalty        = self._ev_departure_penalty(step_idx, new_ev_soc)
+        financial_delta = -energy_cost
+        thermal_penalty = self._thermal_penalty(new_indoor_temp, action.hvac_temperature_setpoint, occupied)
+        ev_penalty = self._ev_departure_penalty(step_idx, new_ev_soc)
         violation_penalty = -0.5 if constraint_violated else 0.0
         loop_penalty, loop_detected = self._loop_penalty(
             action.model_dump(), financial_delta + thermal_penalty
         )
  
         reward = financial_delta + thermal_penalty + ev_penalty + violation_penalty + loop_penalty
- 
-        # --- Advance state ---
+
         self._state.step_count += 1
         self._state.building_thermal_inertia = new_indoor_temp
         done = self._state.step_count >= self.max_steps
- 
-        # --- Diagnostic message ---
+
         diag = "OK"
         if constraint_violated:
             diag = "WARNING: Physical constraint violated — command clamped."
         if ev_penalty < 0:
             diag += " CRITICAL: EV departed below 80% SoC."
- 
-        # --- Build next observation ---
+
         next_step = self._state.step_count
         self._obs = GridEdgeObservation(
             timestamp_iso=self._step_to_iso(next_step),
@@ -253,8 +260,7 @@ class TheLocalMinimaEnvironment(Environment):
  
         dT = (900 / (cfg.thermal_mass_kjperdegc * 1000)) * (Q_conduction + Q_solar_gain + Q_hvac)
         new_temp = T_in + dT
- 
-        # Thermostat snap — HVAC cycles off when close enough to setpoint
+
         if mode != "off" and abs(new_temp - setpoint) < 0.2:
             new_temp = setpoint
  
@@ -313,8 +319,8 @@ class TheLocalMinimaEnvironment(Environment):
         return (step // 4) % 24
 
     def _step_to_iso(self, step: int) -> str:
-        base  = datetime.datetime(2025, 1, 1, 0, 0)
-        delta = datetime.timedelta(minutes=15 * step)
+        base = datetime(2025, 1, 1, 0, 0)
+        delta = timedelta(minutes=15 * step)
         return (base + delta).isoformat()
 
     def _ev_connected(self, step: int) -> bool:
@@ -335,17 +341,17 @@ class TheLocalMinimaEnvironment(Environment):
         return round(max(0.0, min(1.0, self._state.solar_utilized_kwh / available)), 4)
 
     def _score_medium(self) -> float:
-        rbc   = self._state.rbc_baseline_cost
+        rbc = self._state.rbc_baseline_cost
         agent = self._state.cumulative_financial_cost
         if rbc == 0:
             return 0.0
         return round(max(0.0, min(1.0, (rbc - agent) / rbc)), 4)
 
     def _score_hard(self) -> float:
-        cfg        = self._config
-        w1, w3     = 0.4, 0.3
-        alpha      = 2.0
+        cfg = self._config
+        w1, w3 = 0.4, 0.3
+        alpha = 2.0
         cost_ratio = self._state.cumulative_financial_cost / max(self._state.rbc_baseline_cost, 0.001)
         ev_penalty = max(0.0, cfg.ev_min_departure_soc - self._obs.electric_vehicle_soc)
-        J          = w1 * cost_ratio + w3 * ev_penalty
+        J = w1 * cost_ratio + w3 * ev_penalty
         return round(max(0.0, min(1.0, math.exp(-alpha * J))), 4)
