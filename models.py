@@ -3,17 +3,13 @@ from pydantic import Field
 from typing import List, Optional, Literal
 
 class GridEdgeAction(Action):
-    # message: str = Field(..., description="Message to echo back")
     hvac_operational_mode: Literal["off", "cooling", "heating"] = Field(..., description="Operational mode of the HVAC system.")
     hvac_temperature_setpoint: float = Field(..., ge=18.0, le=28.0, description="Target indoor temperature in °C. Must be between 18 and 28.")
     battery_dispatch_command: float = Field(..., ge=-5.0, le=5.0, description="Battery power in kW. Positive=charge, negative=discharge.")
     ev_charging_allocation: float = Field(..., ge=0.0, le=7.2, description="Power allocated to EV charger in kW. 0 means no charging.")
     grid_export_permission: bool = Field(..., description="Whether to allow selling excess solar back to the grid.")
 
-
 class GridEdgeObservation(Observation):
-    # echoed_message: str = Field(default="", description="The echoed message")
-    # message_length: int = Field(default=0, description="Length of the echoed message")
     timestamp_iso: str = Field(..., description="ISO-8601 timestamp of the current simulation step.")
     current_grid_tariff: float = Field(..., description="Current electricity price in ₹/kWh (MSEDCL ToD rate).")
     forecast_grid_tariff: List[float] = Field(..., min_length=6, max_length=6, description="Predicted ₹/kWh tariff for the next 6 hours.")
@@ -24,8 +20,6 @@ class GridEdgeObservation(Observation):
     ev_connection_status: bool = Field(..., description="True if EV is physically plugged into the home charger.")
     indoor_ambient_temp: float = Field(..., description="Current indoor temperature in °C.")
     outdoor_ambient_temp: float = Field(..., description="Current outdoor temperature in °C.")
-    previous_step_reward: float = Field(default=0.0, description="Scalar reward from the previous step. 0.0 at episode start.")
-    episode_terminated: bool = Field(default=False, description="True when the episode has ended (96 steps complete).")
     system_diagnostic_msg: Optional[str] = Field(default=None, description="Human-readable warning if an action was invalid or overridden.")
 
 class GridEdgeRewardInfo(Observation):

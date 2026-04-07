@@ -6,11 +6,11 @@
 
 """The Local Minima Environment."""
 
-from .client import TheLocalMinimaEnv
-from .models import TheLocalMinimaAction, TheLocalMinimaObservation
+from .client import GridEdgeEnv
+from .models import GridEdgeAction, GridEdgeObservation
 
 __all__ = [
-    "TheLocalMinimaAction",
-    "TheLocalMinimaObservation",
-    "TheLocalMinimaEnv",
+    "GridEdgeAction",
+    "GridEdgeObservation",
+    "GridEdgeEnv",
 ]

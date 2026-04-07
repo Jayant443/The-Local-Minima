@@ -1,4 +1,4 @@
-import uuid
+from uuid import uuid4
 from datetime import datetime, timedelta
 from typing import Optional, List
 from openenv.core.env_server.interfaces import Environment
@@ -37,7 +37,7 @@ class HomeConfig:
     # EV
     ev_capacity_kwh: float = 40.0
     ev_max_kw: float = 7.2
-    ev_departure_step: int = 28      # step 28 = 7:00 AM
+    ev_departure_step: int = 28
     ev_min_departure_soc: float = 0.80
 
     # HVAC
@@ -45,8 +45,8 @@ class HomeConfig:
     hvac_cop: float = 3.0
 
     # Building thermal
-    thermal_mass_kjperdegc: float = 5000.0   # C_bldg
-    insulation_resistance: float = 0.05       # R_bldg
+    thermal_mass_kjperdegc: float = 5000.0
+    insulation_resistance: float = 0.05
 
     # Comfort
     comfort_deadband_degc: float = 1.5
@@ -60,6 +60,8 @@ class HomeConfig:
 
 class TheLocalMinimaEnvironment(Environment):
 
+    SUPPORTS_CONCURRENT_SESSIONS: bool = True
+
     def __init__(self):
         self._state: Optional[GridEdgeState] = None
         self._obs:   Optional[GridEdgeObservation] = None
@@ -71,7 +73,6 @@ class TheLocalMinimaEnvironment(Environment):
 
         self._recent_actions: List[dict] = []
         self._consecutive_identical: int = 0
-
 
         self.max_steps = 96
 
@@ -87,6 +88,8 @@ class TheLocalMinimaEnvironment(Environment):
         self._consecutive_identical = 0
  
         self._state = GridEdgeState(
+            episode_id=str(uuid4()),
+            step_count=0,
             cumulative_financial_cost=0.0,
             building_thermal_inertia=22.0,
             true_occupancy_vector=self._build_occupancy_vector(),
@@ -106,8 +109,8 @@ class TheLocalMinimaEnvironment(Environment):
             ev_connection_status=self._ev_connected(0),
             indoor_ambient_temp=22.0,
             outdoor_ambient_temp=self._outdoor_temp(0),
-            previous_step_reward=0.0,
-            episode_terminated=False,
+            reward=None,
+            done=False,
             system_diagnostic_msg="System initialized.",
         )
  
@@ -149,15 +152,13 @@ class TheLocalMinimaEnvironment(Environment):
         self._state.rbc_baseline_cost += base_load * tariff * 0.25
 
         self._state.solar_available_kwh += solar_kw * 0.25
-        self._state.solar_utilized_kwh  += min(solar_kw, total_load) * 0.25
+        self._state.solar_utilized_kwh += min(solar_kw, total_load) * 0.25
  
         financial_delta = -energy_cost
         thermal_penalty = self._thermal_penalty(new_indoor_temp, action.hvac_temperature_setpoint, occupied)
         ev_penalty = self._ev_departure_penalty(step_idx, new_ev_soc)
         violation_penalty = -0.5 if constraint_violated else 0.0
-        loop_penalty, loop_detected = self._loop_penalty(
-            action.model_dump(), financial_delta + thermal_penalty
-        )
+        loop_penalty, loop_detected = self._loop_penalty(action.model_dump(), financial_delta + thermal_penalty)
  
         reward = financial_delta + thermal_penalty + ev_penalty + violation_penalty + loop_penalty
 
@@ -167,17 +168,15 @@ class TheLocalMinimaEnvironment(Environment):
 
         diag = "OK"
         if constraint_violated:
-            diag = "WARNING: Physical constraint violated — command clamped."
+            diag = "WARNING: Physical constraint violated - command clamped."
         if ev_penalty < 0:
-            diag += " CRITICAL: EV departed below 80% SoC."
+            diag += "CRITICAL: EV departed below 80% SoC."
 
         next_step = self._state.step_count
         self._obs = GridEdgeObservation(
             timestamp_iso=self._step_to_iso(next_step),
             current_grid_tariff=get_tariff(self._step_to_hour(next_step)),
-            forecast_grid_tariff=[
-                get_tariff(self._step_to_hour(next_step + i)) for i in range(1, 7)
-            ],
+            forecast_grid_tariff=[get_tariff(self._step_to_hour(next_step + i)) for i in range(1, 7)],
             current_solar_yield=self._solar_kw(next_step),
             forecast_solar_yield=[self._solar_kw(next_step + i) for i in range(1, 7)],
             home_battery_soc=new_batt_soc,
@@ -185,8 +184,8 @@ class TheLocalMinimaEnvironment(Environment):
             ev_connection_status=self._ev_connected(next_step),
             indoor_ambient_temp=new_indoor_temp,
             outdoor_ambient_temp=self._outdoor_temp(next_step),
-            previous_step_reward=round(float(reward), 4),
-            episode_terminated=done,
+            reward=round(float(reward), 4),
+            done=done,
             system_diagnostic_msg=diag,
         )
  
@@ -243,8 +242,7 @@ class TheLocalMinimaEnvironment(Environment):
         delta = (cmd_kw * 0.25 * cfg.inverter_efficiency) / cfg.ev_capacity_kwh
         return round(max(0.0, min(1.0, self._obs.electric_vehicle_soc + delta)), 4)
 
-    def _update_indoor_temp(self, mode: str, setpoint: float,
-                             outdoor_temp: float, ghi: float) -> float:
+    def _update_indoor_temp(self, mode: str, setpoint: float, outdoor_temp: float, ghi: float) -> float:
         cfg  = self._config
         T_in = self._state.building_thermal_inertia
  
@@ -269,7 +267,7 @@ class TheLocalMinimaEnvironment(Environment):
     def _thermal_penalty(self, indoor_temp: float, setpoint: float, occupied: bool) -> float:
         if not occupied:
             return 0.0
-        cfg       = self._config
+        cfg = self._config
         deviation = abs(indoor_temp - setpoint) - cfg.comfort_deadband_degc
         if deviation <= 0:
             return 0.0
@@ -293,7 +291,7 @@ class TheLocalMinimaEnvironment(Environment):
             self._recent_actions.pop(0)
  
         if self._consecutive_identical >= cfg.loop_threshold and step_reward < 0:
-            penalty = -cfg.loop_penalty_base * (2 ** (self._consecutive_identical - cfg.loop_threshold))
+            penalty = -cfg.loop_penalty_base * (2 ** min(self._consecutive_identical - cfg.loop_threshold, 4))
             return round(penalty, 4), True
  
         return 0.0, False

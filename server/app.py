@@ -5,80 +5,96 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-FastAPI application for the The Local Minima Environment.
+FastAPI application for the Grid Edge Home Energy Orchestrator.
 
-This module creates an HTTP server that exposes the TheLocalMinimaEnvironment
-over HTTP and WebSocket endpoints, compatible with EnvClient.
+This module creates the HTTP/WebSocket server that exposes
+TheLocalMinimaEnvironment over endpoints compatible with EnvClient.
 
-Endpoints:
-    - POST /reset: Reset the environment
-    - POST /step: Execute an action
-    - GET /state: Get current environment state
-    - GET /schema: Get action/observation schemas
-    - WS /ws: WebSocket endpoint for persistent sessions
+On startup, it parses the Pune EPW weather file once and injects the
+data into the environment via load_weather(). All subsequent resets()
+reuse this pre-loaded data — no file I/O happens during training.
+
+Endpoints (handled automatically by create_app):
+    POST /reset       Reset the environment, start a new episode
+    POST /step        Execute one action, advance simulation by 15 minutes
+    GET  /state       Get current hidden server-side state (debugging only)
+    GET  /schema      Get action and observation JSON schemas
+    WS   /ws          Persistent WebSocket session for full episode loops
 
 Usage:
-    # Development (with auto-reload):
+    # Development
     uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
 
-    # Production:
-    uvicorn server.app:app --host 0.0.0.0 --port 8000 --workers 4
+    # Production (Docker)
+    uvicorn server.app:app --host 0.0.0.0 --port 7860
 
-    # Or run directly:
+    # Direct execution
     python -m server.app
 """
 
+import os
+
 try:
     from openenv.core.env_server.http_server import create_app
-except Exception as e:  # pragma: no cover
+except Exception as e:
     raise ImportError(
-        "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
+        "openenv-core is required. Install with: pip install openenv-core"
     ) from e
 
 try:
-    from models import TheLocalMinimaAction, TheLocalMinimaObservation
-    from .the_local_minima_environment import TheLocalMinimaEnvironment
+    from models import GridEdgeAction, GridEdgeObservation
+    from .the_local_minima_environment import TheLocalMinimaEnvironment, load_epw
 except ModuleNotFoundError:
-    from models import TheLocalMinimaAction, TheLocalMinimaObservation
-    from server.the_local_minima_environment import TheLocalMinimaEnvironment
+    from models import GridEdgeAction, GridEdgeObservation
+    from server.the_local_minima_environment import TheLocalMinimaEnvironment, load_epw
 
+EPW_PATH = os.path.join(os.path.dirname(__file__), "data", "pune_weather.epw")
 
-# Create the app with web interface and README integration
+_weather_data = None
+_weather_load_error = None
+
+try:
+    _weather_data = load_epw(EPW_PATH)
+    print(f"[grid-edge] Loaded {len(_weather_data)} hourly weather rows from {EPW_PATH}")
+except FileNotFoundError:
+    _weather_load_error = (
+        f"EPW file not found at {EPW_PATH}. "
+        "Place pune_weather.epw in server/data/ before starting the server."
+    )
+    print(f"[grid-edge] WARNING: {_weather_load_error}")
+    print("[grid-edge] Environment will run with fallback weather (25°C, 0 GHI).")
+except Exception as e:
+    _weather_load_error = f"Failed to parse EPW file: {e}"
+    print(f"[grid-edge] WARNING: {_weather_load_error}")
+
+def create_environment() -> TheLocalMinimaEnvironment:
+    env = TheLocalMinimaEnvironment()
+
+    if _weather_data is not None:
+        env.load_weather(_weather_data)
+    else:
+        print("[grid-edge] Session started without weather data — using fallback values.")
+
+    return env
+
 app = create_app(
-    TheLocalMinimaEnvironment,
-    TheLocalMinimaAction,
-    TheLocalMinimaObservation,
-    env_name="the_local_minima",
-    max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
+    create_environment,
+    GridEdgeAction,
+    GridEdgeObservation,
+    env_name="grid_edge",
+    max_concurrent_envs=4,
 )
 
 
 def main(host: str = "0.0.0.0", port: int = 8000):
-    """
-    Entry point for direct execution via uv run or python -m.
-
-    This function enables running the server without Docker:
-        uv run --project . server
-        uv run --project . server --port 8001
-        python -m the_local_minima.server.app
-
-    Args:
-        host: Host address to bind to (default: "0.0.0.0")
-        port: Port number to listen on (default: 8000)
-
-    For production deployments, consider using uvicorn directly with
-    multiple workers:
-        uvicorn the_local_minima.server.app:app --workers 4
-    """
     import uvicorn
-
     uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Grid Edge Environment Server")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
-    main(port=args.port)
+    main(host=args.host, port=args.port)
