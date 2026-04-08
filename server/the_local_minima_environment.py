@@ -13,7 +13,7 @@ def load_epw(path: str) -> list[dict]:
     for _, row in weather_df.iterrows():
         hours.append({
             "outdoor_temp": float(row["temp_air"]),
-            "ghi":          float(row["ghi"]),
+            "ghi": float(row["ghi"]),
         })
     
     return hours
@@ -37,7 +37,7 @@ class HomeConfig:
     # EV
     ev_capacity_kwh: float = 40.0
     ev_max_kw: float = 7.2
-    ev_departure_step: int = 28
+    ev_departure_step: int = 28      # step 28 = 7:00 AM
     ev_min_departure_soc: float = 0.80
 
     # HVAC
@@ -45,8 +45,8 @@ class HomeConfig:
     hvac_cop: float = 3.0
 
     # Building thermal
-    thermal_mass_kjperdegc: float = 5000.0
-    insulation_resistance: float = 0.05
+    thermal_mass_kjperdegc: float = 5000.0   # C_bldg
+    insulation_resistance: float = 0.05       # R_bldg
 
     # Comfort
     comfort_deadband_degc: float = 1.5
@@ -54,6 +54,10 @@ class HomeConfig:
 
     loop_threshold: float = 3.0
     loop_penalty_base: float = 0.2
+
+    # Reward normalization bounds — map raw reward to [0, 1].
+    reward_raw_min: float = -25.0
+    reward_raw_max: float =   6.0
 
     load_profile: List[float] = [0.3, 0.3, 0.3, 0.3, 0.3, 0.4, 0.6, 0.9, 1.0, 0.8, 0.7, 0.7, 0.7, 0.6, 0.6, 0.7, 0.8, 1.2, 1.5, 1.8, 1.6, 1.2, 0.8, 0.5]
 
@@ -64,8 +68,8 @@ class TheLocalMinimaEnvironment(Environment):
 
     def __init__(self):
         self._state: Optional[GridEdgeState] = None
-        self._obs:   Optional[GridEdgeObservation] = None
-        self._task:  str = "solar_self_consumption"
+        self._obs: Optional[GridEdgeObservation] = None
+        self._task: str = "solar_self_consumption"
         self._config: HomeConfig = HomeConfig()
 
         self._weather_data: Optional[List[dict]] = None
@@ -173,6 +177,8 @@ class TheLocalMinimaEnvironment(Environment):
             diag += "CRITICAL: EV departed below 80% SoC."
 
         next_step = self._state.step_count
+        norm_reward = self._normalize_reward(reward)
+
         self._obs = GridEdgeObservation(
             timestamp_iso=self._step_to_iso(next_step),
             current_grid_tariff=get_tariff(self._step_to_hour(next_step)),
@@ -184,13 +190,13 @@ class TheLocalMinimaEnvironment(Environment):
             ev_connection_status=self._ev_connected(next_step),
             indoor_ambient_temp=new_indoor_temp,
             outdoor_ambient_temp=self._outdoor_temp(next_step),
-            reward=round(float(reward), 4),
+            reward=norm_reward,
             done=done,
             system_diagnostic_msg=diag,
         )
  
         self._last_reward_info = GridEdgeRewardInfo(
-            aggregate_step_reward=round(float(reward), 4),
+            aggregate_step_reward=norm_reward,
             financial_delta_component=round(financial_delta, 4),
             thermal_penalty_component=round(thermal_penalty, 4),
             constraint_violation_flag=constraint_violated,
@@ -211,6 +217,11 @@ class TheLocalMinimaEnvironment(Environment):
         else:
             return self._score_hard()
         
+    def _normalize_reward(self, raw: float) -> float:
+        cfg = self._config
+        span = cfg.reward_raw_max - cfg.reward_raw_min
+        return round(max(0.0, min(1.0, (raw - cfg.reward_raw_min) / span)), 4)
+
     def _clamp_battery(self, cmd: float):
         soc = self._obs.home_battery_soc
         if cmd > 0 and soc >= 0.99:
@@ -221,7 +232,7 @@ class TheLocalMinimaEnvironment(Environment):
 
     def _clamp_ev(self, cmd: float):
         if not self._obs.ev_connection_status:
-            return 0.0, cmd > 0
+            return 0.0, False  # not connected - silently zero, not a violation
         if self._obs.electric_vehicle_soc >= 0.99 and cmd > 0:
             return 0.0, True
         return cmd, False
@@ -291,7 +302,8 @@ class TheLocalMinimaEnvironment(Environment):
             self._recent_actions.pop(0)
  
         if self._consecutive_identical >= cfg.loop_threshold and step_reward < 0:
-            penalty = -cfg.loop_penalty_base * (2 ** min(self._consecutive_identical - cfg.loop_threshold, 4))
+            exponent = min(self._consecutive_identical - cfg.loop_threshold, 4)
+            penalty = -cfg.loop_penalty_base * (2 ** exponent)
             return round(penalty, 4), True
  
         return 0.0, False

@@ -10,15 +10,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from server.the_local_minima_environment import TheLocalMinimaEnvironment
+from client import GridEdgeEnv
 from models import GridEdgeAction, GridEdgeObservation
 
 API_KEY = os.getenv("HF_TOKEN")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-# MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-MODEL_NAME = "Qwen/Qwen2.5-72B-Instruct"
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 TASK_NAME = os.getenv("TASK", "solar_self_consumption")
-BENCHMARK = os.getenv("BENCHMARK", "grid_edge_v1")
+BENCHMARK = "grid_edge_v1"
+IMAGE_NAME = os.getenv("IMAGE_NAME")
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:8000")
+
+TASKS = [
+    "solar_self_consumption",
+    "tod_arbitrage",
+    "full_orchestration"
+]
 
 MAX_STEPS = 96   
 TEMPERATURE = 0.6
@@ -112,65 +119,73 @@ def get_model_action(client: OpenAI, step: int, obs_dict: Dict[str, Any], last_r
     except Exception as exc:
         return extract_json_action(""), str(exc)
 
-async def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    env = TheLocalMinimaEnvironment()
+async def run_task(client: OpenAI, task_name: str) -> None:
+    if IMAGE_NAME:
+        env_instance = await GridEdgeEnv.from_docker_image(IMAGE_NAME, task=task_name)
+    else:
+        env_instance = GridEdgeEnv(base_url=ENV_BASE_URL)
+
     history: List[str] = []
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
     success = False
 
-    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        obs: GridEdgeObservation = env.reset(task=TASK_NAME)
-        obs_dict = obs_to_dict(obs)
-        last_reward = 0.0
+        with env_instance as env:
+            obs: GridEdgeObservation = env.reset(task=task_name)
+            obs_dict = obs_to_dict(obs)
+            last_reward = 0.0
 
-        for step in range(1, MAX_STEPS + 1):
-            await asyncio.sleep(10)
-            action, error_msg = get_model_action(client, step, obs_dict, last_reward, history)
+            for step in range(1, MAX_STEPS + 1):
+                await asyncio.sleep(10)
+                action, error_msg = get_model_action(client, step, obs_dict, last_reward, history)
 
-            action_str = (
-                f"GridEdgeAction(hvac='{action.hvac_operational_mode}',"
-                f"sp={action.hvac_temperature_setpoint},"
-                f"batt={action.battery_dispatch_command},"
-                f"ev={action.ev_charging_allocation},"
-                f"export={action.grid_export_permission})"
-            )
+                action_str = (
+                    f"GridEdgeAction(hvac='{action.hvac_operational_mode}',"
+                    f"sp={action.hvac_temperature_setpoint},"
+                    f"batt={action.battery_dispatch_command},"
+                    f"ev={action.ev_charging_allocation},"
+                    f"export={action.grid_export_permission})"
+                )
 
-            try:
-                obs = env.step(action)
-                obs_dict = obs_to_dict(obs)
-                reward = obs.reward if obs.reward is not None else 0.0
-                done = obs.done
+                try:
+                    obs = env.step(action)
+                    obs_dict = obs_to_dict(obs)
+                    reward = obs.reward if obs.reward is not None else 0.0
+                    done = obs.done
 
-                diag = obs.system_diagnostic_msg or "OK"
-                if "WARNING" in diag or "CRITICAL" in diag:
-                    error_msg = diag
+                    diag = obs.system_diagnostic_msg or "OK"
+                    if "WARNING" in diag or "CRITICAL" in diag:
+                        error_msg = diag
 
-            except Exception as exc:
-                reward = -5.0
-                done = True
-                error_msg = str(exc)
+                except Exception as exc:
+                    reward = -5.0
+                    done = True
+                    error_msg = str(exc)
 
-            rewards.append(reward)
-            steps_taken = step
-            last_reward = reward
+                rewards.append(reward)
+                steps_taken = step
+                last_reward = reward
 
-            log_step(step=step, action=action_str, reward=reward, done=done, error=error_msg)
-            history.append(f"Step {step}: {action_str} | reward {reward:+.2f}")
+                log_step(step=step, action=action_str, reward=reward, done=done, error=error_msg)
+                history.append(f"Step {step}: {action_str} | reward {reward:+.2f}")
 
-            if done:
-                break
+                if done:
+                    break
 
-        score   = env.score()
-        success = score >= SUCCESS_SCORE_THRESHOLD
+            score = env.score()
+            success = score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
         log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
+async def main() -> None:
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    for task_name in TASKS:
+        await run_task(client, task_name)
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -5,60 +5,22 @@
 # LICENSE file in the root directory of this source tree.
 
 
-from typing import Dict, List, Optional
+from typing import Dict, Any
 
 from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import GridEdgeAction, GridEdgeObservation, GridEdgeState
+from models import GridEdgeAction, GridEdgeObservation, GridEdgeState
 
 class GridEdgeEnv(EnvClient[GridEdgeAction, GridEdgeObservation, GridEdgeState]):
     """
     Client for the Grid Edge Home Energy Orchestrator environment.
-
-    Basic usage (sync):
-        >>> env = GridEdgeEnv(base_url="ws://localhost:8000").sync()
-        >>> with env:
-        ...     result = env.reset()
-        ...     while not result.done:
-        ...         action = agent.predict(result.observation)
-        ...         result = env.step(action)
-        ...     print("Score:", env.score())
-
-    Async usage:
-        >>> async with GridEdgeEnv(base_url="ws://localhost:8000") as env:
-        ...     result = await env.reset()
-        ...     while not result.done:
-        ...         action = agent.predict(result.observation)
-        ...         result = await env.step(action)
-
-    From Docker image (auto-starts container):
-        >>> client = GridEdgeEnv.from_docker_image("grid-edge-env:latest")
-        >>> try:
-        ...     result = client.reset()
-        ...     result = client.step(GridEdgeAction(
-        ...         hvac_operational_mode="cooling",
-        ...         hvac_temperature_setpoint=24.0,
-        ...         battery_dispatch_command=-2.0,
-        ...         ev_charging_allocation=3.5,
-        ...         grid_export_permission=True,
-        ...     ))
-        ... finally:
-        ...     client.close()
-
-    From Hugging Face Space:
-        >>> client = await GridEdgeEnv.from_env("openenv/grid-edge-env")
+    This client maintains a persistent websockets connection to the environment server.
     """
 
     def _step_payload(self, action: GridEdgeAction) -> Dict:
-        return {
-            "hvac_operational_mode":    action.hvac_operational_mode,
-            "hvac_temperature_setpoint": action.hvac_temperature_setpoint,
-            "battery_dispatch_command":  action.battery_dispatch_command,
-            "ev_charging_allocation":    action.ev_charging_allocation,
-            "grid_export_permission":    action.grid_export_permission,
-        }
+        return action.model_dump()
 
     def _parse_result(self, payload: Dict) -> StepResult[GridEdgeObservation]:
         obs = payload.get("observation", {})
@@ -100,7 +62,7 @@ class GridEdgeEnv(EnvClient[GridEdgeAction, GridEdgeObservation, GridEdgeState])
             done=payload.get("done", False),
         )
 
-    def _parse_state(self, payload: Dict) -> GridEdgeState:
+    def _parse_state(self, payload: Dict[str, Any]) -> GridEdgeState:
         return GridEdgeState(
             episode_id=payload.get("episode_id", None),
             step_count=payload.get("step_count", 0),
