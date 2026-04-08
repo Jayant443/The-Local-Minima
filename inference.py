@@ -73,8 +73,13 @@ def extract_json_action(text: str) -> GridEdgeAction:
         grid_export_permission=False,
     )
 
-def obs_to_dict(obs: GridEdgeObservation) -> Dict[str, Any]:
-    return obs.model_dump()
+def obs_to_dict(obs):
+    if hasattr(obs, "model_dump"):
+        return obs.model_dump()
+    elif hasattr(obs, "observation"):
+        return obs.observation.model_dump()
+    else:
+        return {}
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
@@ -134,13 +139,13 @@ async def run_task(client: OpenAI, task_name: str) -> None:
     log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
     try:
-        with env_instance as env:
-            obs: GridEdgeObservation = env.reset(task=task_name)
+        async with env_instance as env:
+            result = await env.reset(task=task_name)
+            obs = result.observation if hasattr(result, "observation") else result
             obs_dict = obs_to_dict(obs)
             last_reward = 0.0
 
             for step in range(1, MAX_STEPS + 1):
-                await asyncio.sleep(10)
                 action, error_msg = get_model_action(client, step, obs_dict, last_reward, history)
 
                 action_str = (
@@ -152,10 +157,11 @@ async def run_task(client: OpenAI, task_name: str) -> None:
                 )
 
                 try:
-                    obs = env.step(action)
+                    result = await env.step(action)
+                    obs = result.observation
+                    reward = result.reward
+                    done = result.done
                     obs_dict = obs_to_dict(obs)
-                    reward = obs.reward if obs.reward is not None else 0.0
-                    done = obs.done
 
                     diag = obs.system_diagnostic_msg or "OK"
                     if "WARNING" in diag or "CRITICAL" in diag:
